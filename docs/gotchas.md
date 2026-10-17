@@ -37,6 +37,11 @@ check first.
   default). `zoom.max` defaults to the larger of 1.5 and dpr.
 - **Terminal rows and editor lines span the full width.** Their rectangles are therefore taken
   from the characters themselves (a DOM Range), first to last non-blank.
+- **ffmpeg refuses expressions about 100 deep.** It parses a flat `a+b+c…` (or `a;b;c…`) into a
+  tree as deep as it has terms. A long zoomed hold on a page that keeps changing repeats many
+  frames, and its warp timing summed one term per repeat: from about 95 terms, `perspective`
+  failed with "Cannot allocate memory" (and `setpts` with "Invalid argument"). Sums and
+  statement sequences are built balanced (`balancedSum` in `src/post/render.mjs`), log2(n) deep.
 
 ## Lightweight terminal (`h.terminal.open`)
 

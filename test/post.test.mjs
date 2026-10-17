@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { segments, smooth, view_track, box_at, windows, speed_tag, beat_plan, captionPieces, transitionPlan } from '../src/post/logic.mjs';
-import { runs, perspectiveExpressions, beatCacheKey, cut as renderCut, assemble as renderAssemble, ffmpeg, ffmpegStderr, pill } from '../src/post/render.mjs';
+import { runs, perspectiveExpressions, balancedSum, beatCacheKey, cut as renderCut, assemble as renderAssemble, ffmpeg, ffmpegStderr, pill } from '../src/post/render.mjs';
 import { directCamera, fitSegment, fitTargets, motionIntervals, readingSeconds } from '../src/post/fit.mjs';
 
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'vectors');
@@ -155,7 +155,7 @@ function compilePerspective(source) {
   const take = (v) => { if (tokens[at] !== v) throw new Error(`want ${v}, got ${tokens[at]}`); at++; };
   const primary = () => {
     const t = tokens[at++];
-    if (t === '(') { const e = sum(); take(')'); return e; }
+    if (t === '(') { const e = sequence(); take(')'); return e; }
     if (t === '-') return ['neg', primary()];
     if (/^(?:\d|\.)/.test(t)) return ['number', Number(t)];
     if (t === 'in') return ['input'];
@@ -167,8 +167,9 @@ function compilePerspective(source) {
   };
   const product = () => { let e = primary(); while (tokens[at] === '*' || tokens[at] === '/') { const op = tokens[at++]; e = [op, e, primary()]; } return e; };
   const sum = () => { let e = product(); while (tokens[at] === '+' || tokens[at] === '-') { const op = tokens[at++]; e = [op, e, product()]; } return e; };
-  const statements = [sum()];
-  while (tokens[at] === ';') { at++; statements.push(sum()); }
+  // a;b;c runs each in order and is worth the last, at the top level or inside parentheses.
+  const sequence = () => { const e = ['seq', sum()]; while (tokens[at] === ';') { at++; e.push(sum()); } return e.length === 2 ? e[1] : e; };
+  const top = sequence();
   assert.equal(at, tokens.length);
   return (frame) => {
     const registers = [];
@@ -183,14 +184,37 @@ function compilePerspective(source) {
         case 'between': return Number(v(1) >= v(2) && v(1) <= v(3));
         case 'st': { const index = v(1), value = v(2); registers[index] = value; return value; }
         case 'ld': return registers[v(1)] ?? 0;
+        case 'seq': { let last; for (let i = 1; i < e.length; i++) last = v(i); return last; }
         default: throw new Error(`unknown operation ${e[0]}`);
       }
     };
-    let result;
-    for (const statement of statements) result = evaluate(statement);
-    return result;
+    return evaluate(top);
   };
 }
+
+// How deep ffmpeg's parser nests an expression: a flat a+b+c… is as deep as it has terms.
+function expressionDepth(source) {
+  let depth = 0, deepest = 0, chain = 0;
+  for (const token of source.replace(/\\,/g, ',').match(/[()+;]|[^()+;]+/g)) {
+    if (token === '(') { depth++; chain = 0; } else if (token === ')') depth--;
+    else if (token === '+' || token === ';') chain++;
+    deepest = Math.max(deepest, depth + chain);
+  }
+  return deepest;
+}
+
+test('balancedSum keeps the value and the order of statements, at log depth', () => {
+  for (const n of [1, 2, 3, 7, 100, 513]) {
+    const terms = Array.from({ length: n }, (_, i) => String(i + 1));
+    assert.equal(compilePerspective(balancedSum(terms))(0), n * (n + 1) / 2);
+    assert.ok(expressionDepth(balancedSum(terms)) <= 2 * Math.ceil(Math.log2(n + 1)) + 1, `${n} terms`);
+    // Each statement reads the one before it, so a reordering changes the result.
+    const statements = terms.map((t, i) => `st(0\\,${i}-ld(0)*0.5)`).concat('ld(0)');
+    const flat = compilePerspective(statements.join(';'))(0);
+    assert.equal(compilePerspective(balancedSum(statements, ';'))(0), flat);
+  }
+  assert.equal(balancedSum([]), '0');
+});
 
 function cameraFixture(moves, start = 0) {
   const full = [0, 0, 320, 180], keys = [[-1e18, full]];
@@ -258,6 +282,46 @@ test('ffmpeg renders a synthetic take with 20 camera moves at the planned frame 
       path.join(root, 'clips', 'moves.mp4')], { encoding: 'utf8' });
     assert.equal(probe.status, 0, probe.stderr);
     assert.equal(Number(probe.stdout.trim()), expected);
+  } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }
+});
+
+// A long beat whose page changes every other tick has one repeated frame per run: summed flat,
+// that timing made ffmpeg's perspective fail ("Cannot allocate memory") from about 95 terms.
+test('ffmpeg renders a long zoomed hold of 120+ repeated frames after 41 camera moves', { timeout: 180000 }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ghostcast-long-'));
+  try {
+    const raw = path.join(root, 'raw', 'long'); fs.mkdirSync(path.join(raw, 'frames'), { recursive: true });
+    const first = path.join(raw, 'frames', 'f0.jpg');
+    const image = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+      'testsrc2=s=320x180:d=0.1', '-frames:v', '1', '-y', first], { encoding: 'utf8' });
+    assert.equal(image.status, 0, image.stderr);
+    // A new frame every other tick for 14 s; 41 camera moves in the first 4 s, the last one a
+    // zoom that then holds, so the hold's repeated frames all go through the warp.
+    const frames = [];
+    for (let i = 0; i < 212; i++) {
+      if (i) fs.copyFileSync(first, path.join(raw, 'frames', `f${i}.jpg`));
+      frames.push([0.2 + i * 0.066, `f${i}.jpg`]);
+    }
+    const project = { name: 'long', viewport: { width: 320, height: 180, dpr: 1 },
+      output: { width: 320, height: 180, fps: 30 } };
+    fs.writeFileSync(path.join(root, 'project.json'), JSON.stringify(project));
+    fs.writeFileSync(path.join(raw, 'frames.json'), JSON.stringify(frames));
+    const log = [[200, '+long']];
+    for (let i = 0; i < 41; i++) log.push([300 + i * 100, i % 2 ? 'unfocus' : 'focus',
+      { x: 40 + i % 4 * 12, y: 25, w: 80, h: 45 }]);
+    log.push([14200, '-long']);
+    fs.writeFileSync(path.join(raw, 'log.json'), JSON.stringify(log));
+    const plan = beat_plan(log, frames, project, 320, 180);
+    const repeated = runs(plan.beats[0].ticks).filter((r) => r.count > 1).length;
+    assert.ok(repeated > 120, `only ${repeated} repeated runs`);
+    const cli = path.resolve(dir, '..', '..', 'bin', 'ghostcast.mjs');
+    const render = spawnSync(process.execPath, [cli, 'cut', 'long', '--project', root],
+      { encoding: 'utf8', timeout: 180000 });
+    assert.equal(render.status, 0, render.stdout + render.stderr);
+    const probe = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=nb_frames', '-of', 'csv=p=0',
+      path.join(root, 'clips', 'long.mp4')], { encoding: 'utf8' });
+    assert.equal(probe.status, 0, probe.stderr);
+    assert.equal(Number(probe.stdout.trim()), plan.beats.reduce((n, b) => n + b.ticks.length, 0));
   } finally { fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }
 });
 

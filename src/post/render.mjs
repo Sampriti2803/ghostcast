@@ -71,6 +71,16 @@ export function runs(ticks) {
   return out;
 }
 
+// ffmpeg parses a flat a+b+c… (or a;b;c…) into a tree as deep as it has terms, and refuses one
+// about 100 deep: perspective failed with "Cannot allocate memory" on a long beat whose warp
+// timing summed 93 repeated-frame terms. Balanced, the same sum (or sequence: statements still
+// run in order and the last one's value is kept) is only log2(n) deep.
+export function balancedSum(terms, op = '+') {
+  if (terms.length <= 1) return terms[0] ?? '0';
+  const mid = terms.length >> 1;
+  return `(${balancedSum(terms.slice(0, mid), op)}${op}${balancedSum(terms.slice(mid), op)})`;
+}
+
 export function perspectiveExpressions(runs, beat, keys) {
   const same = runs.every((r) => r.box.every((v, i) => v === runs[0].box[i]));
   const corner = (box, i) => i === 0 ? box[0] : i === 1 ? box[1] : i === 2 ? box[0] + box[2] : box[1] + box[3];
@@ -84,7 +94,7 @@ export function perspectiveExpressions(runs, beat, keys) {
     else if (tk <= last) moves.push([tk, target]);
   }
   const offsets = runs.slice(0, -1).flatMap((r, i) => r.count > 1 ? [`${r.count - 1}*gte(in\\,${i + 2})`] : []);
-  const tick = `(in-1${offsets.length ? '+' + offsets.join('+') : ''})`;
+  const tick = `(in-1${offsets.length ? '+' + balancedSum(offsets) : ''})`;
   const time = `st(1\\,${beat.a.toFixed(9)}+${tick}*${(beat.speed / beat.fps).toFixed(12)})`;
   return [0, 1, 2, 3].map((i) => {
     if (!moves.length) return corner(initial, i).toFixed(9);
@@ -95,7 +105,7 @@ export function perspectiveExpressions(runs, beat, keys) {
       steps.push(`st(0\\,ld(0)+(${corner(target, i).toFixed(9)}-ld(0))*ld(3))`);
     }
     steps.push('ld(0)');
-    return steps.join(';');
+    return balancedSum(steps, ';');
   });
 }
 
@@ -109,7 +119,7 @@ function perspective(runs, beat, keys) {
       if (spans.length && i === spans.at(-1)[1] + 1) spans.at(-1)[1] = i;
       else spans.push([i, i]);
     }
-    enable = `:enable='${spans.map(([a, b]) => `between(n\\,${a}\\,${b})`).join('+')}'`;
+    enable = `:enable='${balancedSum(spans.map(([a, b]) => `between(n\\,${a}\\,${b})`))}'`;
   }
   const [x, y, right, bottom] = perspectiveExpressions(runs, beat, keys);
   return `perspective=x0='${x}':y0='${y}':x1='${right}':y1='${y}':x2='${x}':y2='${bottom}':x3='${right}':y3='${bottom}':sense=source:eval=frame:interpolation=cubic${enable}`;
@@ -127,7 +137,7 @@ function sourcePts(rs, fps) {
   // Concat's image demuxer timestamps have a 1/25 time base on some builds. Set exact tick
   // timestamps before fps repeats holds; the sentinel frame marks the last run's end.
   const offsets = rs.map((r, i) => r.count > 1 ? `${r.count - 1}*gte(N\\,${i + 1})` : null).filter(Boolean);
-  return `(N${offsets.length ? '+' + offsets.join('+') : ''})/(${fps}*TB)`;
+  return `(N${offsets.length ? '+' + balancedSum(offsets) : ''})/(${fps}*TB)`;
 }
 
 export async function pill(root, cfg, text, pos, getBrowser) {
